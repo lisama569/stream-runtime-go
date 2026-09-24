@@ -3,6 +3,7 @@ package stream
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -40,6 +41,12 @@ func TopologyHash(opName string, windowSize, allowedLateness int64) string {
 	return fmt.Sprintf("%s/w%d/l%d", opName, windowSize, allowedLateness)
 }
 
+// windowMsg 是算子发往汇的消息：普通结果或同步屏障。
+type windowMsg struct {
+	result  *WindowResult
+	barrier chan struct{} // 非 nil 时表示屏障：汇处理完此前所有结果后关闭它
+}
+
 // Pipeline 串联 源 -> 窗口算子 -> 结果汇，提供背压、检查点与故障隔离。
 type Pipeline struct {
 	source   Source
@@ -61,9 +68,15 @@ func NewPipeline(src Source, op *WindowOperator, sink Sink, store *CheckpointSto
 }
 
 // Run 运行流水线直到源耗尽。
-// 若 store 中存在合法检查点则先恢复；检查点非法时返回可区分错误并拒绝运行，
-// 不会从中间状态继续。下游过慢触发背压阻塞，超时返回 ErrBackpressureTimeout；
-// 算子或汇失败返回带上下文的 OpError（ErrOperatorFailed），已提交检查点不丢失。
+//
+// 恢复语义：若 store 中存在合法检查点则先恢复（源位移、水位线、窗口状态），
+// 检查点非法时返回可区分错误并拒绝运行，不会从中间状态继续。
+//
+// 背压：算子与汇之间是有界通道（MaxInFlight），下游变慢会阻塞上游，
+// 超过 SendTimeout 返回 ErrBackpressureTimeout，不会静默丢数据或无上限堆积。
+//
+// 故障隔离：算子 panic 与汇写失败都被归类为带上下文的 OpError（ErrOperatorFailed），
+// 已提交的检查点不受影响，恢复后结果仍正确（汇按窗口+键幂等去重）。
 func (p *Pipeline) Run() (err error) {
 	logg := p.opts.Logger
 	// 1. 尝试从检查点恢复。
@@ -83,14 +96,21 @@ func (p *Pipeline) Run() (err error) {
 	}
 
 	// 2. 启动有界结果通道 + 独立写汇协程（背压边界）。
-	results := make(chan WindowResult, p.opts.MaxInFlight)
+	results := make(chan windowMsg, p.opts.MaxInFlight)
 	sinkErr := make(chan error, 1)
 	sinkDone := make(chan struct{})
+	var closeOnce sync.Once
 	go func() {
 		defer close(sinkDone)
-		for r := range results {
-			if werr := p.sink.Write(r); werr != nil {
-				sinkErr <- &OpError{Op: "sink", Kind: ErrOperatorFailed, Msg: werr.Error()}
+		for msg := range results {
+			if msg.barrier != nil {
+				close(msg.barrier)
+				continue
+			}
+			r := msg.result
+			if werr := p.sink.Write(*r); werr != nil {
+				sinkErr <- &OpError{Op: "sink", Offset: p.source.Offset(),
+					Kind: ErrOperatorFailed, Msg: werr.Error()}
 				return
 			}
 			logg.Printf("[sink] committed window=[%d,%d) key=%s sum=%d count=%d",
@@ -104,7 +124,7 @@ func (p *Pipeline) Run() (err error) {
 			err = &OpError{Op: p.operator.name, Offset: p.source.Offset(),
 				Kind: ErrOperatorFailed, Msg: fmt.Sprintf("panic: %v", rec)}
 		}
-		close(results)
+		closeOnce.Do(func() { close(results) })
 		<-sinkDone
 	}()
 
@@ -117,9 +137,9 @@ func (p *Pipeline) Run() (err error) {
 		out := p.operator.Process(rec)
 		logg.Printf("[record] offset=%d key=%s ts=%d value=%d watermark=%d emitted=%d",
 			rec.Offset, rec.Key, rec.EventTime, rec.Value, p.operator.Watermark(), len(out))
-		for _, r := range out {
+		for i := range out {
 			select {
-			case results <- r:
+			case results <- windowMsg{result: &out[i]}:
 			case serr := <-sinkErr:
 				return serr
 			case <-time.After(p.opts.SendTimeout):
@@ -130,20 +150,49 @@ func (p *Pipeline) Run() (err error) {
 		}
 		processed++
 		if p.store != nil && processed%int64(p.opts.CheckpointEvery) == 0 {
-			if cerr := p.checkpoint(logg); cerr != nil {
+			if cerr := p.syncAndCheckpoint(results, sinkErr, logg); cerr != nil {
 				return cerr
 			}
 		}
 	}
-	// 4. 结束前做最终检查点，保证重启后可精确续跑。
+	// 4. 结束前做最终屏障 + 检查点，保证重启后可精确续跑。
 	if p.store != nil {
-		if cerr := p.checkpoint(logg); cerr != nil {
+		if cerr := p.syncAndCheckpoint(results, sinkErr, logg); cerr != nil {
 			return cerr
 		}
+	}
+	closeOnce.Do(func() { close(results) })
+	<-sinkDone
+	select {
+	case serr := <-sinkErr:
+		return serr
+	default:
 	}
 	return nil
 }
 
+// syncAndCheckpoint 先发屏障确保此前所有结果已写入汇，再保存检查点，
+// 保证检查点只覆盖已落汇的结果，崩溃恢复不重不漏。
+func (p *Pipeline) syncAndCheckpoint(results chan<- windowMsg, sinkErr <-chan error, logg *log.Logger) error {
+	barrier := make(chan struct{})
+	select {
+	case results <- windowMsg{barrier: barrier}:
+	case serr := <-sinkErr:
+		return serr
+	case <-time.After(p.opts.SendTimeout):
+		return &OpError{Op: "checkpoint-barrier", Offset: p.source.Offset(),
+			Kind: ErrBackpressureTimeout, Msg: "sink not draining, cannot checkpoint"}
+	}
+	select {
+	case <-barrier:
+	case serr := <-sinkErr:
+		return serr
+	case <-time.After(p.opts.SendTimeout):
+		return &OpError{Op: "checkpoint-barrier", Offset: p.source.Offset(),
+			Kind: ErrBackpressureTimeout, Msg: "sink not draining, cannot checkpoint"}
+	}
+	return p.checkpoint(logg)
+}
 
 // checkpoint 保存当前源位移、水位线与窗口状态。
 func (p *Pipeline) checkpoint(logg *log.Logger) error {
