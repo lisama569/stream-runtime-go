@@ -30,6 +30,17 @@ func (g *WatermarkGenerator) Current() int64 {
 	return g.maxSeen - g.maxOutOfOrderness
 }
 
+// MaxSeen 返回已观察到的最大事件时间。
+func (g *WatermarkGenerator) MaxSeen() int64 { return g.maxSeen }
+
+// Restore 从检查点恢复已见最大事件时间，保证水位线单调不回退。
+func (g *WatermarkGenerator) Restore(maxSeen int64) {
+	if !g.initialized || maxSeen > g.maxSeen {
+		g.maxSeen = maxSeen
+	}
+	g.initialized = true
+}
+
 // IsLate 判断事件时间是否落后于水位线（严格小于视为迟到）。
 func (g *WatermarkGenerator) IsLate(eventTime int64) bool {
 	return g.initialized && eventTime < g.Current()
