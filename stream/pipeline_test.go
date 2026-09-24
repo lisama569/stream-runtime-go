@@ -260,3 +260,44 @@ func (s *panicSource) Next() (Record, bool) {
 }
 func (s *panicSource) Offset() int64           { return s.inner.Offset() }
 func (s *panicSource) SeekOffset(offset int64) { s.inner.SeekOffset(offset) }
+
+// 连续两次故障、两次从检查点恢复，最终结果仍与无故障运行一致。
+func TestPipelineRepeatedRecovery(t *testing.T) {
+	dir := t.TempDir()
+	topo := TopologyHash("win", 100, 50)
+	sharedSink := NewMemSink()
+
+	// 第一次运行：第 1 次写入后失败。
+	p1 := newTestPipeline(t, NewMemSource(buildInput()),
+		&flakySink{inner: sharedSink, failAfter: 1},
+		NewCheckpointStore(dir, topo, time.Hour), time.Second)
+	if err := p1.Run(); !errors.Is(err, ErrOperatorFailed) {
+		t.Fatalf("run1 expected ErrOperatorFailed, got %v", err)
+	}
+	// 第二次运行（恢复）：第 2 次写入后再次失败。
+	p2 := newTestPipeline(t, NewMemSource(buildInput()),
+		&flakySink{inner: sharedSink, failAfter: 2},
+		NewCheckpointStore(dir, topo, time.Hour), time.Second)
+	if err := p2.Run(); !errors.Is(err, ErrOperatorFailed) {
+		t.Fatalf("run2 expected ErrOperatorFailed, got %v", err)
+	}
+	// 第三次运行（再次恢复）：完整跑完。
+	p3 := newTestPipeline(t, NewMemSource(buildInput()), sharedSink,
+		NewCheckpointStore(dir, topo, time.Hour), time.Second)
+	if err := p3.Run(); err != nil {
+		t.Fatalf("run3 failed: %v", err)
+	}
+
+	refSink := NewMemSink()
+	ref := newTestPipeline(t, NewMemSource(buildInput()), refSink,
+		NewCheckpointStore(t.TempDir(), topo, time.Hour), time.Second)
+	if err := ref.Run(); err != nil {
+		t.Fatal(err)
+	}
+	got, want := sortedResults(sharedSink), sortedResults(refSink)
+	if !equalResults(got, want) {
+		t.Fatalf("repeated recovery mismatch:\n got=%+v\n want=%+v", got, want)
+	}
+	t.Logf("[test] repeated recovery verified: %d windows, sink writes=%d (idempotent overwrite)",
+		len(got), sharedSink.writes)
+}
