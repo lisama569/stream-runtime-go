@@ -1,0 +1,4 @@
+# 运行时本地产物
+.runtime-demo/
+.scratch/
+*.tmp
