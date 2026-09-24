@@ -258,5 +258,5 @@ func (s *panicSource) Next() (Record, bool) {
 	}
 	return s.inner.Next()
 }
-func (s *panicSource) Offset() int64          { return s.inner.Offset() }
+func (s *panicSource) Offset() int64           { return s.inner.Offset() }
 func (s *panicSource) SeekOffset(offset int64) { s.inner.SeekOffset(offset) }
