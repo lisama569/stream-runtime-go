@@ -15,6 +15,12 @@ type Options struct {
 	SendTimeout time.Duration
 	// CheckpointEvery 每处理多少条记录做一次检查点。
 	CheckpointEvery int
+	// SinkMaxRetries 下游写入失败时的隔离重试次数（同一次运行内）。
+	// 重试在写汇协程内原位进行，不占用额外内存、不破坏有界背压；
+	// 额度用完才以 ErrSinkRetriesExhausted 失败。0 表示不重试。
+	SinkMaxRetries int
+	// SinkRetryBackoff 每次重试前的退避等待时间。
+	SinkRetryBackoff time.Duration
 	// Logger 处理流水日志（水位线、检查点、记录），nil 则用默认。
 	Logger *log.Logger
 }
@@ -29,6 +35,12 @@ func (o *Options) withDefaults() Options {
 	}
 	if out.CheckpointEvery <= 0 {
 		out.CheckpointEvery = 100
+	}
+	if out.SinkMaxRetries < 0 {
+		out.SinkMaxRetries = 0
+	}
+	if out.SinkRetryBackoff <= 0 {
+		out.SinkRetryBackoff = 20 * time.Millisecond
 	}
 	if out.Logger == nil {
 		out.Logger = log.Default()
@@ -71,11 +83,17 @@ func NewPipeline(src Source, op *WindowOperator, sink Sink, store *CheckpointSto
 //
 // 恢复语义：若 store 中存在合法检查点则先恢复（源位移、水位线、窗口状态），
 // 检查点非法时返回可区分错误并拒绝运行，不会从中间状态继续。
+// 检查点记录的消费位置若落在源当前数据范围之外（数据被裁剪、回放区间变窄），
+// 以 ErrCheckpointOffsetOutOfRange 拒绝恢复，不会悄悄从最近位置续读。
 //
 // 背压：算子与汇之间是有界通道（MaxInFlight），下游变慢会阻塞上游，
 // 超过 SendTimeout 返回 ErrBackpressureTimeout，不会静默丢数据或无上限堆积。
 //
-// 故障隔离：算子 panic 与汇写失败都被归类为带上下文的 OpError（ErrOperatorFailed），
+// 下游抖动：汇写失败在同一次运行内做有限次数（SinkMaxRetries）的原位重试，
+// 重试在有界通道内完成，不额外占用内存；额度用完才以
+// ErrSinkRetriesExhausted（属 ErrOperatorFailed）失败，并定位到具体窗口与键。
+//
+// 故障隔离：算子 panic 与汇写失败都被归类为带上下文的 OpError，
 // 已提交的检查点不受影响，恢复后结果仍正确（汇按窗口+键幂等去重）。
 func (p *Pipeline) Run() (err error) {
 	logg := p.opts.Logger
@@ -86,6 +104,16 @@ func (p *Pipeline) Run() (err error) {
 			return fmt.Errorf("refuse to run: %w", lerr)
 		}
 		if cp != nil {
+			// 消费位置越界校验：源能报告数据范围时，检查点位移必须落在
+			// [min, max] 内，否则拒绝恢复（不允许悄悄从最近位置续读）。
+			if rs, ok := p.source.(RangedSource); ok {
+				min, max := rs.OffsetRange()
+				if cp.SourceOffset < min || cp.SourceOffset > max {
+					return &OpError{Op: "restore", Offset: cp.SourceOffset,
+						Kind: ErrCheckpointOffsetOutOfRange,
+						Msg:  fmt.Sprintf("checkpoint offset %d outside source range [%d, %d]", cp.SourceOffset, min, max)}
+				}
+			}
 			p.operator.restore(cp.Windows, cp.MaxSeen)
 			p.source.SeekOffset(cp.SourceOffset)
 			logg.Printf("[checkpoint] restored offset=%d watermark=%d windows=%d",
@@ -108,9 +136,8 @@ func (p *Pipeline) Run() (err error) {
 				continue
 			}
 			r := msg.result
-			if werr := p.sink.Write(*r); werr != nil {
-				sinkErr <- &OpError{Op: "sink", Offset: p.source.Offset(),
-					Kind: ErrOperatorFailed, Msg: werr.Error()}
+			if werr := p.writeWithRetry(*r, logg); werr != nil {
+				sinkErr <- werr
 				return
 			}
 			logg.Printf("[sink] committed window=[%d,%d) key=%s sum=%d count=%d",
@@ -167,6 +194,28 @@ func (p *Pipeline) Run() (err error) {
 	case serr := <-sinkErr:
 		return serr
 	default:
+	}
+	return nil
+}
+
+// writeWithRetry 在写汇协程内原位重试下游写入：
+// 重试期间结果仍占着有界通道的位置，背压与内存上限不被破坏；
+// 已算出的结果按原顺序逐条重试（汇按窗口+键幂等），不重不漏。
+// 额度用完返回带窗口/键/位移上下文的 ErrSinkRetriesExhausted。
+func (p *Pipeline) writeWithRetry(r WindowResult, logg *log.Logger) error {
+	err := p.sink.Write(r)
+	for attempt := 1; err != nil && attempt <= p.opts.SinkMaxRetries; attempt++ {
+		logg.Printf("[sink] retry attempt=%d/%d window=[%d,%d) key=%s offset=%d err=%v",
+			attempt, p.opts.SinkMaxRetries, r.Window.Start, r.Window.End, r.Key,
+			p.source.Offset(), err)
+		time.Sleep(p.opts.SinkRetryBackoff)
+		err = p.sink.Write(r)
+	}
+	if err != nil {
+		return &OpError{Op: "sink", Offset: p.source.Offset(),
+			Kind: ErrSinkRetriesExhausted,
+			Msg: fmt.Sprintf("window=[%d,%d) key=%s: %v (retries=%d)",
+				r.Window.Start, r.Window.End, r.Key, err, p.opts.SinkMaxRetries)}
 	}
 	return nil
 }

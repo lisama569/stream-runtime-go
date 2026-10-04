@@ -1,7 +1,9 @@
 package stream
 
 import (
+	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -107,6 +109,63 @@ func TestCheckpointExpiredRejected(t *testing.T) {
 		t.Fatalf("expected ErrCheckpointExpired, got %v", err)
 	}
 	t.Logf("[test] expired checkpoint rejected: %v", err)
+}
+
+// 来自更早状态结构的检查点（格式版本不一致）单独归类为 ErrCheckpointLegacyFormat，
+// 且与损坏、配置不一致可区分。
+func TestCheckpointLegacyFormatRejected(t *testing.T) {
+	dir := t.TempDir()
+	// 手工写入一个版本号为 0、校验和正确的“老格式”检查点。
+	cp := Checkpoint{
+		Version:      0,
+		TopologyHash: "topo-1",
+		CreatedAt:    time.Now().Unix(),
+		SourceOffset: 3,
+		Windows:      map[string]windowState{},
+	}
+	body, err := json.Marshal(&cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.Checksum = crc32.ChecksumIEEE(body)
+	full, err := json.Marshal(&cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "checkpoint.json"), full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, lerr := NewCheckpointStore(dir, "topo-1", time.Hour).Load()
+	if !errors.Is(lerr, ErrCheckpointLegacyFormat) {
+		t.Fatalf("expected ErrCheckpointLegacyFormat, got %v", lerr)
+	}
+	if !errors.Is(lerr, ErrCheckpointIncompatible) {
+		t.Fatalf("legacy format should also be ErrCheckpointIncompatible, got %v", lerr)
+	}
+	if errors.Is(lerr, ErrCheckpointCorrupt) || errors.Is(lerr, ErrCheckpointConfigMismatch) {
+		t.Fatalf("legacy format misclassified: %v", lerr)
+	}
+	t.Logf("[test] legacy checkpoint rejected: %v", lerr)
+}
+
+// 配置不一致（拓扑指纹不同）单独归类为 ErrCheckpointConfigMismatch。
+func TestCheckpointConfigMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	// 用窗口 100/乱序 50 的配置保存，用窗口 200 的配置加载。
+	if err := NewCheckpointStore(dir, TopologyHash("win", 100, 50), time.Hour).Save(testCheckpoint()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewCheckpointStore(dir, TopologyHash("win", 200, 50), time.Hour).Load()
+	if !errors.Is(err, ErrCheckpointConfigMismatch) {
+		t.Fatalf("expected ErrCheckpointConfigMismatch, got %v", err)
+	}
+	if !errors.Is(err, ErrCheckpointIncompatible) {
+		t.Fatalf("config mismatch should also be ErrCheckpointIncompatible, got %v", err)
+	}
+	if errors.Is(err, ErrCheckpointCorrupt) || errors.Is(err, ErrCheckpointLegacyFormat) {
+		t.Fatalf("config mismatch misclassified: %v", err)
+	}
+	t.Logf("[test] config mismatch rejected: %v", err)
 }
 
 // 三类非法检查点必须互相可区分。

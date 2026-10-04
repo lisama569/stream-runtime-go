@@ -261,6 +261,175 @@ func (s *panicSource) Next() (Record, bool) {
 func (s *panicSource) Offset() int64           { return s.inner.Offset() }
 func (s *panicSource) SeekOffset(offset int64) { s.inner.SeekOffset(offset) }
 
+// 调参重启：窗口大小变化后，旧检查点必须被判定为配置不一致并拒绝恢复，
+// 且与损坏、旧格式可区分，不得产出任何结果。
+func TestPipelineRefusesConfigMismatch(t *testing.T) {
+	dir := t.TempDir()
+	// 用窗口 100/乱序 50 跑一段并留下检查点。
+	store := NewCheckpointStore(dir, TopologyHash("win", 100, 50), time.Hour)
+	if err := store.Save(&Checkpoint{SourceOffset: 5, Watermark: 200, MaxSeen: 250,
+		Windows: map[string]windowState{}}); err != nil {
+		t.Fatal(err)
+	}
+	// 调参：窗口改为 200，其余不变，用同一检查点目录重启。
+	op := NewWindowOperator("win", NewWindowAssigner(200), NewWatermarkGenerator(50))
+	sink := NewMemSink()
+	p := NewPipeline(NewMemSource(buildInput()), op, sink,
+		NewCheckpointStore(dir, TopologyHash("win", 200, 50), time.Hour),
+		Options{MaxInFlight: 2, SendTimeout: time.Second, CheckpointEvery: 3, Logger: testLogger(t)})
+	err := p.Run()
+	if !errors.Is(err, ErrCheckpointConfigMismatch) {
+		t.Fatalf("expected ErrCheckpointConfigMismatch, got %v", err)
+	}
+	if errors.Is(err, ErrCheckpointCorrupt) || errors.Is(err, ErrCheckpointLegacyFormat) {
+		t.Fatalf("config mismatch misclassified: %v", err)
+	}
+	if len(sink.Results()) != 0 {
+		t.Fatalf("pipeline must not run on config mismatch, got %d results", len(sink.Results()))
+	}
+	t.Logf("[test] config change refused before any processing: %v", err)
+}
+
+// 检查点记录的消费位置落在当前数据范围之外（尾部越界与头部被裁两种），
+// 必须明确拒绝恢复并给出原因，不得悄悄从最近位置续读。
+func TestPipelineRefusesOutOfRangeOffset(t *testing.T) {
+	topo := TopologyHash("win", 100, 50)
+
+	// 情形一：检查点位移超出数据末尾（回放区间变窄）。
+	t.Run("beyond end", func(t *testing.T) {
+		dir := t.TempDir()
+		store := NewCheckpointStore(dir, topo, time.Hour)
+		if err := store.Save(&Checkpoint{SourceOffset: 100, Watermark: 200, MaxSeen: 250,
+			Windows: map[string]windowState{}}); err != nil {
+			t.Fatal(err)
+		}
+		sink := NewMemSink()
+		p := newTestPipeline(t, NewMemSource(buildInput()), sink, store, time.Second)
+		err := p.Run()
+		if !errors.Is(err, ErrCheckpointOffsetOutOfRange) {
+			t.Fatalf("expected ErrCheckpointOffsetOutOfRange, got %v", err)
+		}
+		if errors.Is(err, ErrCheckpointCorrupt) || errors.Is(err, ErrCheckpointConfigMismatch) {
+			t.Fatalf("offset out of range misclassified: %v", err)
+		}
+		if len(sink.Results()) != 0 {
+			t.Fatalf("must not silently resume, got %d results", len(sink.Results()))
+		}
+		var opErr *OpError
+		if errors.As(err, &opErr) {
+			t.Logf("[test] out-of-range refused with context: %v", opErr)
+		}
+	})
+
+	// 情形二：检查点位移落在被裁掉的头部之前。
+	t.Run("trimmed head", func(t *testing.T) {
+		dir := t.TempDir()
+		store := NewCheckpointStore(dir, topo, time.Hour)
+		if err := store.Save(&Checkpoint{SourceOffset: 2, Watermark: 200, MaxSeen: 250,
+			Windows: map[string]windowState{}}); err != nil {
+			t.Fatal(err)
+		}
+		src := NewMemSource(buildInput())
+		src.TrimBefore(5) // 本地数据被裁，只保留位移 >= 5 的记录
+		sink := NewMemSink()
+		p := newTestPipeline(t, src, sink, store, time.Second)
+		err := p.Run()
+		if !errors.Is(err, ErrCheckpointOffsetOutOfRange) {
+			t.Fatalf("expected ErrCheckpointOffsetOutOfRange, got %v", err)
+		}
+		if len(sink.Results()) != 0 {
+			t.Fatalf("must not silently resume, got %d results", len(sink.Results()))
+		}
+		t.Logf("[test] trimmed-head out-of-range refused: %v", err)
+	})
+}
+
+// transientSink 前 failTimes 次写入失败，之后恢复正常（模拟下游抖动）。
+type transientSink struct {
+	inner     *MemSink
+	failTimes int
+	attempts  int // 总写入尝试次数（含重试）
+}
+
+func (s *transientSink) Write(r WindowResult) error {
+	s.attempts++
+	if s.attempts <= s.failTimes {
+		return errors.New("downstream temporarily unavailable")
+	}
+	return s.inner.Write(r)
+}
+
+// 下游连续失败后重试成功：同一次运行内完成隔离重试，
+// 结果与无故障参考运行一致（不重不漏），重试次数可观察。
+func TestPipelineSinkRetrySuccess(t *testing.T) {
+	// 参考运行：无故障。
+	refSink := NewMemSink()
+	ref := newTestPipeline(t, NewMemSource(buildInput()), refSink, nil, time.Second)
+	if err := ref.Run(); err != nil {
+		t.Fatal(err)
+	}
+	want := sortedResults(refSink)
+
+	// 下游前 3 次写入失败，重试额度 4。
+	flaky := &transientSink{inner: NewMemSink(), failTimes: 3}
+	op := NewWindowOperator("win", NewWindowAssigner(100), NewWatermarkGenerator(50))
+	p := NewPipeline(NewMemSource(buildInput()), op, flaky, nil, Options{
+		MaxInFlight:      2, // 有界背压保持不变
+		SendTimeout:      2 * time.Second,
+		CheckpointEvery:  3,
+		SinkMaxRetries:   4,
+		SinkRetryBackoff: time.Millisecond,
+		Logger:           testLogger(t),
+	})
+	if err := p.Run(); err != nil {
+		t.Fatalf("run with retries should succeed, got %v", err)
+	}
+	got := sortedResults(flaky.inner)
+	if !equalResults(got, want) {
+		t.Fatalf("retry run mismatch:\n got=%+v\n want=%+v", got, want)
+	}
+	if flaky.attempts != flaky.inner.Writes()+flaky.failTimes {
+		t.Fatalf("unexpected attempt count: attempts=%d committed=%d",
+			flaky.attempts, flaky.inner.Writes())
+	}
+	t.Logf("[test] retry succeeded: attempts=%d committed=%d windows=%d (no dup/loss)",
+		flaky.attempts, flaky.inner.Writes(), len(got))
+}
+
+// 重试额度用完才让运行失败：错误可区分（ErrSinkRetriesExhausted，
+// 同时属于 ErrOperatorFailed），并定位到出问题的窗口与键。
+func TestPipelineSinkRetryExhausted(t *testing.T) {
+	alwaysFail := &transientSink{inner: NewMemSink(), failTimes: 1 << 30}
+	op := NewWindowOperator("win", NewWindowAssigner(100), NewWatermarkGenerator(50))
+	p := NewPipeline(NewMemSource(buildInput()), op, alwaysFail, nil, Options{
+		MaxInFlight:      2,
+		SendTimeout:      time.Second,
+		CheckpointEvery:  3,
+		SinkMaxRetries:   2,
+		SinkRetryBackoff: time.Millisecond,
+		Logger:           testLogger(t),
+	})
+	err := p.Run()
+	if !errors.Is(err, ErrSinkRetriesExhausted) {
+		t.Fatalf("expected ErrSinkRetriesExhausted, got %v", err)
+	}
+	if !errors.Is(err, ErrOperatorFailed) {
+		t.Fatalf("exhausted retries should still be ErrOperatorFailed, got %v", err)
+	}
+	if errors.Is(err, ErrBackpressureTimeout) {
+		t.Fatalf("retry exhaustion misclassified as backpressure: %v", err)
+	}
+	var opErr *OpError
+	if !errors.As(err, &opErr) || opErr.Op != "sink" {
+		t.Fatalf("error should locate sink, got %v", err)
+	}
+	// 首次失败 + 2 次重试 = 3 次尝试后放弃。
+	if alwaysFail.attempts != 3 {
+		t.Fatalf("expected 3 write attempts (1+2 retries), got %d", alwaysFail.attempts)
+	}
+	t.Logf("[test] retries exhausted with context: %v (attempts=%d)", err, alwaysFail.attempts)
+}
+
 // 连续两次故障、两次从检查点恢复，最终结果仍与无故障运行一致。
 func TestPipelineRepeatedRecovery(t *testing.T) {
 	dir := t.TempDir()

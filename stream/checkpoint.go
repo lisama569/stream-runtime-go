@@ -3,6 +3,7 @@ package stream
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io/fs"
 	"os"
@@ -68,7 +69,9 @@ func (s *CheckpointStore) Save(cp *Checkpoint) error {
 
 // Load 加载并校验检查点。
 // 校验失败返回可区分错误：过期 ErrCheckpointExpired、
-// 损坏 ErrCheckpointCorrupt、拓扑不兼容 ErrCheckpointIncompatible。
+// 损坏 ErrCheckpointCorrupt、不兼容 ErrCheckpointIncompatible
+// （可进一步区分为旧格式 ErrCheckpointLegacyFormat 与
+// 配置不一致 ErrCheckpointConfigMismatch）。
 // 无检查点时返回 (nil, nil)。
 func (s *CheckpointStore) Load() (*Checkpoint, error) {
 	data, err := os.ReadFile(s.path())
@@ -93,9 +96,15 @@ func (s *CheckpointStore) Load() (*Checkpoint, error) {
 		return nil, errors.Join(ErrCheckpointCorrupt, errors.New("checksum mismatch"))
 	}
 	cp.Checksum = got
-	// 版本与拓扑兼容性。
-	if cp.Version != CheckpointFormatVersion || cp.TopologyHash != s.topology {
-		return nil, ErrCheckpointIncompatible
+	// 版本兼容性：来自更早（或更新）状态结构的检查点单独归类。
+	if cp.Version != CheckpointFormatVersion {
+		return nil, errors.Join(ErrCheckpointIncompatible, ErrCheckpointLegacyFormat,
+			fmt.Errorf("checkpoint format version %d, runtime expects %d", cp.Version, CheckpointFormatVersion))
+	}
+	// 运行配置兼容性：拓扑指纹（算子名/窗口大小/允许乱序度）不一致。
+	if cp.TopologyHash != s.topology {
+		return nil, errors.Join(ErrCheckpointIncompatible, ErrCheckpointConfigMismatch,
+			fmt.Errorf("checkpoint config %q, current %q", cp.TopologyHash, s.topology))
 	}
 	// 过期判定。
 	if s.maxAge > 0 && s.now().Unix() > cp.CreatedAt+int64(s.maxAge.Seconds()) {

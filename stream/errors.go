@@ -1,17 +1,32 @@
 package stream
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // 可区分的错误类别。
 var (
 	// ErrCheckpointCorrupt 检查点文件损坏（校验和不匹配或无法解析）。
 	ErrCheckpointCorrupt = errors.New("stream: checkpoint corrupt")
-	// ErrCheckpointIncompatible 检查点与当前拓扑不兼容。
-	ErrCheckpointIncompatible = errors.New("stream: checkpoint incompatible with topology")
+	// ErrCheckpointIncompatible 检查点与当前运行配置不兼容的总类别。
+	// 具体原因可用 ErrCheckpointLegacyFormat / ErrCheckpointConfigMismatch 进一步区分。
+	ErrCheckpointIncompatible = errors.New("stream: checkpoint incompatible")
+	// ErrCheckpointLegacyFormat 检查点来自更早（或更新）的状态结构，格式版本不一致。
+	ErrCheckpointLegacyFormat = errors.New("stream: checkpoint legacy format version")
+	// ErrCheckpointConfigMismatch 检查点记录的运行配置（窗口大小、允许乱序度、算子名）
+	// 与当前实际生效配置不一致。
+	ErrCheckpointConfigMismatch = errors.New("stream: checkpoint config mismatch")
+	// ErrCheckpointOffsetOutOfRange 检查点记录的消费位置落在当前数据范围之外
+	// （数据被裁剪或回放区间变窄）。
+	ErrCheckpointOffsetOutOfRange = errors.New("stream: checkpoint offset out of range")
 	// ErrCheckpointExpired 检查点已过期（超过保留时间）。
 	ErrCheckpointExpired = errors.New("stream: checkpoint expired")
 	// ErrOperatorFailed 单个算子执行失败。
 	ErrOperatorFailed = errors.New("stream: operator failed")
+	// ErrSinkRetriesExhausted 下游写入重试额度用完，本次运行失败。
+	// 属于 ErrOperatorFailed 的一种（errors.Is 两者都成立）。
+	ErrSinkRetriesExhausted = fmt.Errorf("%w: sink retries exhausted", ErrOperatorFailed)
 	// ErrBackpressureTimeout 下游背压超时。
 	ErrBackpressureTimeout = errors.New("stream: backpressure timeout")
 	// ErrPipelineClosed 流水线已关闭。
