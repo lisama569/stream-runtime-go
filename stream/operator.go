@@ -85,6 +85,16 @@ func (o *WindowOperator) fireWindows() []WindowResult {
 // Watermark 返回当前水位线。
 func (o *WindowOperator) Watermark() int64 { return o.wm.Current() }
 
+// Config 返回算子实际生效的运行配置（算子名、窗口大小、允许乱序度），
+// 用于检查点兼容性判定——以算子真实参数为准，而不是外部声明。
+func (o *WindowOperator) Config() RuntimeConfig {
+	return RuntimeConfig{
+		OperatorName:    o.name,
+		WindowSize:      o.assigner.Size,
+		AllowedLateness: o.wm.maxOutOfOrderness,
+	}
+}
+
 // LateRecords 返回被水位线拒绝的迟到记录列表。
 func (o *WindowOperator) LateRecords() []LateRecord {
 	out := make([]LateRecord, len(o.lates))

@@ -1,7 +1,9 @@
 package stream
 
 import (
+	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -127,6 +129,106 @@ func TestCheckpointErrorsAreDistinguishable(t *testing.T) {
 	if !errors.Is(errCorrupt, ErrCheckpointCorrupt) ||
 		errors.Is(errCorrupt, ErrCheckpointIncompatible) ||
 		errors.Is(errCorrupt, ErrCheckpointExpired) {
+		t.Fatalf("corrupt misclassified: %v", errCorrupt)
+	}
+}
+
+func testRuntimeConfig() RuntimeConfig {
+	return RuntimeConfig{OperatorName: "win", WindowSize: 100, AllowedLateness: 50}
+}
+
+// 配置变化（窗口大小、允许乱序度）后的检查点必须被拒绝，
+// 且与损坏、版本过旧可区分。
+func TestCheckpointConfigMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testRuntimeConfig()
+	if err := NewCheckpointStoreWithConfig(dir, cfg, time.Hour).Save(testCheckpoint()); err != nil {
+		t.Fatal(err)
+	}
+	// 相同配置可以正常加载（往返一致）。
+	cp, err := NewCheckpointStoreWithConfig(dir, cfg, time.Hour).Load()
+	if err != nil || cp == nil {
+		t.Fatalf("same config should load, got cp=%v err=%v", cp, err)
+	}
+	if cp.Config != cfg {
+		t.Fatalf("checkpoint should record effective config, got %+v", cp.Config)
+	}
+	// 调整窗口大小 -> 拒绝。
+	changed := cfg
+	changed.WindowSize = 200
+	_, err = NewCheckpointStoreWithConfig(dir, changed, time.Hour).Load()
+	if !errors.Is(err, ErrCheckpointConfigMismatch) {
+		t.Fatalf("expected ErrCheckpointConfigMismatch, got %v", err)
+	}
+	if errors.Is(err, ErrCheckpointCorrupt) || errors.Is(err, ErrCheckpointVersionMismatch) {
+		t.Fatalf("config mismatch misclassified: %v", err)
+	}
+	// 调整允许乱序度 -> 同样拒绝。
+	changed = cfg
+	changed.AllowedLateness = 10
+	if _, err = NewCheckpointStoreWithConfig(dir, changed, time.Hour).Load(); !errors.Is(err, ErrCheckpointConfigMismatch) {
+		t.Fatalf("lateness change expected ErrCheckpointConfigMismatch, got %v", err)
+	}
+	t.Logf("[test] config mismatch rejected and distinguishable: %v", err)
+}
+
+// 来自更早状态结构（格式版本过旧）的检查点必须单独归类拒绝。
+func TestCheckpointVersionMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	store := NewCheckpointStoreWithConfig(dir, testRuntimeConfig(), time.Hour)
+	if err := store.Save(testCheckpoint()); err != nil {
+		t.Fatal(err)
+	}
+	// 把文件改写成旧版本号并重算校验和（内容本身完好）。
+	p := filepath.Join(dir, "checkpoint.json")
+	data, _ := os.ReadFile(p)
+	var cp Checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		t.Fatal(err)
+	}
+	cp.Version = CheckpointFormatVersion - 1
+	cp.Checksum = 0
+	body, _ := json.Marshal(&cp)
+	cp.Checksum = crc32.ChecksumIEEE(body)
+	full, _ := json.Marshal(&cp)
+	if err := os.WriteFile(p, full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Load()
+	if !errors.Is(err, ErrCheckpointVersionMismatch) {
+		t.Fatalf("expected ErrCheckpointVersionMismatch, got %v", err)
+	}
+	if errors.Is(err, ErrCheckpointCorrupt) || errors.Is(err, ErrCheckpointConfigMismatch) {
+		t.Fatalf("version mismatch misclassified: %v", err)
+	}
+	t.Logf("[test] old-format checkpoint rejected: %v", err)
+}
+
+// 损坏、版本过旧、配置不匹配三类必须两两可区分。
+func TestCheckpointNewErrorsAreDistinguishable(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testRuntimeConfig()
+	if err := NewCheckpointStoreWithConfig(dir, cfg, time.Hour).Save(testCheckpoint()); err != nil {
+		t.Fatal(err)
+	}
+	// 配置不匹配：不是损坏、不是版本过旧。
+	changed := cfg
+	changed.WindowSize = 500
+	_, errCfg := NewCheckpointStoreWithConfig(dir, changed, time.Hour).Load()
+	if !errors.Is(errCfg, ErrCheckpointConfigMismatch) ||
+		errors.Is(errCfg, ErrCheckpointCorrupt) ||
+		errors.Is(errCfg, ErrCheckpointVersionMismatch) {
+		t.Fatalf("config mismatch misclassified: %v", errCfg)
+	}
+	// 损坏：不是配置不匹配、不是版本过旧。
+	p := filepath.Join(dir, "checkpoint.json")
+	data, _ := os.ReadFile(p)
+	data[10] ^= 0xFF
+	_ = os.WriteFile(p, data, 0o644)
+	_, errCorrupt := NewCheckpointStoreWithConfig(dir, cfg, time.Hour).Load()
+	if !errors.Is(errCorrupt, ErrCheckpointCorrupt) ||
+		errors.Is(errCorrupt, ErrCheckpointConfigMismatch) ||
+		errors.Is(errCorrupt, ErrCheckpointVersionMismatch) {
 		t.Fatalf("corrupt misclassified: %v", errCorrupt)
 	}
 }
